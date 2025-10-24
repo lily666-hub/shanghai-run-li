@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>🏃‍♀️ 智能跑步导航与语音播报</title>
+  <style>
+    html, body, #map { height: 100%; margin: 0; padding: 0; }
+    #info {
+      position: absolute;
+      top: 10px; left: 10px;
+      background: rgba(255,255,255,0.9);
+      padding: 10px 15px;
+      border-radius: 8px;
+      box-shadow: 0 0 6px rgba(0,0,0,0.3);
+      font-family: "Microsoft Yahei";
+      z-index: 1000;
+    }
+  </style>
+  <script src="https://webapi.amap.com/maps?v=2.0&key=e80dae89effb8a8a89f9e178be2974a3"></script>
+</head>
+<body>
+  <div id="info">🏃 跑步导航启动中，正在定位...</div>
+  <div id="map"></div>
+
+  <script>
+    let map, userPos, waypoints = [];
+    let visited = new Set();
+    // ===== 全局 overlays 和到达控制 =====
+    let overlays = [];         // 存放 marker / polyline，方便清理
+    let arrivalEnabled = false; // 在用户真正移动后才允许触发到达播报
+let lastUserPos = null;     // 记录上一次位置，用于判定是否移动
+
+    // ========== 初始化地图 ==========
+    map = new AMap.Map("map", { zoom: 15 });
+
+    // ========== 第一步：获取用户当前位置 ==========
+    AMap.plugin("AMap.Geolocation", function() {
+      const geo = new AMap.Geolocation({
+        enableHighAccuracy: true,
+        timeout: 10000,
+        showButton: false,
+        showMarker: true,
+        panToLocation: true
+      });
+      map.addControl(geo);
+
+      geo.getCurrentPosition((status, result) => {
+        if (status === 'complete') {
+          userPos = result.position;
+          document.getElementById("info").innerText = "✅ 定位成功，正在生成跑步路线...";
+          generateDynamicRoute(userPos.lat, userPos.lng);
+        } else {
+          document.getElementById("info").innerText = "⚠️ 定位失败，请检查权限";
+        }
+      });
+    });
+
+ 
+
+// ========== 第二步（替换）: 基于当前位置与 AI 结果确定起点（保证起点在用户 100m 内），其余保留 AI 规划 ==========
+function generateDynamicRoute(lat, lng) {
+  const user = { name: "起点(你)", lat: lat, lng: lng, desc: "你的当前位置（已作为起点）" };
+
+  // 清理旧覆盖物
+  overlays.forEach(o => o.setMap && o.setMap(null));
+  overlays = [];
+  visited.clear();
+  arrivalEnabled = false;
+  lastUserPos = { lat, lng };
+
+  // 获取 aiPlan（示例变量，真实项目请用 fetch 获取）
+  if (typeof aiPlan !== 'undefined' && aiPlan.waypoints && aiPlan.waypoints.length) {
+    const aiFirst = aiPlan.waypoints[0];
+    const d = getDistance(lat, lng, aiFirst.lat, aiFirst.lng);
+
+    if (d <= 100) {
+      // AI 的第一个点就在用户 100m 内 -> 使用 AI 起点（尊重AI）
+      waypoints = aiPlan.waypoints.slice();
+      console.log(`AI 起点距离用户 ${Math.round(d)}m，使用 AI 起点作为起点。`);
+      document.getElementById("info").innerText = `✅ 使用 AI 起点（距你 ${Math.round(d)}m），生成路线中...`;
+    } else {
+      // AI 第一点不在 100m 内 -> 把用户插为首位，保留 AI 后续点
+      waypoints = [ user, ...aiPlan.waypoints ];
+      console.log(`AI 起点距离用户 ${Math.round(d)}m，已将用户设为起点，AI 其余点保留。`);
+      document.getElementById("info").innerText = `✅ 以你为起点 (距 AI 起点 ${Math.round(d)}m)，生成路线中...`;
+    }
+  } else {
+    // 回退：若没有 AI 输出，生成一个示例远终点（终点不是紧邻用户）
+    const randomOffset = () => (Math.random() - 0.5) * 0.0015; // 约 ±150m
+    waypoints = [
+      user,
+      { name: "本地观景A", lat: lat + randomOffset(), lng: lng + randomOffset(), desc: "本地示例观景点" },
+      { name: "本地终点", lat: lat + 0.009 + Math.abs(randomOffset()), lng: lng + 0.009 + Math.abs(randomOffset()), desc: "本地示例终点（约1km+）" }
+    ];
+    document.getElementById("info").innerText = "⚠️ 未检测到 AI 路线，已生成本地示例路线（终点远于100m）。";
+    console.log("未提供 aiPlan，使用回退本地路线示例。");
+  }
+
+  // 在地图上添加 markers
+  waypoints.forEach(p => {
+    const m = new AMap.Marker({
+      position: [p.lng, p.lat],
+      map: map,
+      title: p.name,
+      content: `<div style="background:#007bff;color:#fff;padding:2px 6px;border-radius:4px">${p.name}</div>`
+    });
+    overlays.push(m);
+  });
+
+  // 调用分段规划并绘制（适合长距离）
+  drawRouteSegments();
+}
+
+// ========== 第三步：对每一对 consecutive waypoints 做分段规划并选择“较优”路径 ==========
+function drawRouteSegments() {
+  if (!waypoints || waypoints.length < 2) {
+    document.getElementById("info").innerText = "⚠️ 无有效途径点";
+    return;
+  }
+
+  const segments = [];
+  for (let i = 0; i < waypoints.length - 1; i++) {
+    const d = getDistance(waypoints[i].lat, waypoints[i].lng, waypoints[i+1].lat, waypoints[i+1].lng);
+    if (d < 8) continue; // 距离太短的段跳过
+    segments.push({ from: waypoints[i], to: waypoints[i+1], idx: i });
+  }
+
+  const CONCURRENCY = 3;
+  let running = 0, ptr = 0;
+
+  function next() {
+    if (ptr >= segments.length && running === 0) {
+      document.getElementById("info").innerText = "✅ 全部路段生成完毕，开始导航";
+      return;
+    }
+    while (running < CONCURRENCY && ptr < segments.length) {
+      const seg = segments[ptr++];
+      running++;
+      AMap.plugin(['AMap.Driving'], function() {
+        const driving = new AMap.Driving({ map: map, policy: AMap.DrivingPolicy.LEAST_TIME });
+        driving.search(
+          new AMap.LngLat(seg.from.lng, seg.from.lat),
+          new AMap.LngLat(seg.to.lng, seg.to.lat),
+          { waypoints: [], extensions: 'all' },
+          function(status, result) {
+            running--;
+            if (status === 'complete' && result && result.routes && result.routes.length) {
+              const paths = result.routes[0].paths || [];
+              let bestPath = paths[0];
+              for (const p of paths) {
+                if (p.steps && bestPath.steps && p.steps.length < bestPath.steps.length) bestPath = p;
+              }
+              if (bestPath && bestPath.steps) {
+                const pts = bestPath.steps.map(s => s.polyline)
+                  .join(';').split(';')
+                  .map(pair => pair.split(',').map(Number));
+                const poly = new AMap.Polyline({
+                  path: pts,
+                  strokeColor: seg.idx % 2 === 0 ? '#0091ff' : '#00c853',
+                  strokeWeight: 4,
+                  map: map
+                });
+                overlays.push(poly);
+              }
+            }
+            next();
+          }
+        );
+      });
+    }
+  }
+  next();
+}
+
+// ========== 第四步：开始实时定位监听（移动 >5m 后启用到达） ==========
+function startPositionWatch() {
+  AMap.plugin("AMap.Geolocation", function() {
+    const geo = new AMap.Geolocation({ enableHighAccuracy: true, timeout: 10000 });
+    geo.watchPosition((status, result) => {
+      if (status === 'complete') {
+        const pos = result.position;
+        if (!arrivalEnabled) {
+          const moved = lastUserPos ? getDistance(lastUserPos.lat, lastUserPos.lng, pos.lat, pos.lng) : 0;
+          if (moved > 5) {
+            arrivalEnabled = true;
+            console.log('检测到移动 >5m，启用到达触发');
+          } else {
+            lastUserPos = { lat: pos.lat, lng: pos.lng };
+          }
+        }
+        handlePosition(pos);
+      }
+    });
+  });
+}
+
+// ========== 到达检测 + 语音播报（仅当 arrivalEnabled 为 true 时才触发） ==========
+function handlePosition(pos) {
+  const userLat = pos.lat;
+  const userLng = pos.lng;
+  lastUserPos = { lat: userLat, lng: userLng };
+
+  if (!arrivalEnabled) return;
+
+  for (const p of waypoints) {
+    const dist = getDistance(userLat, userLng, p.lat, p.lng);
+    if (dist < 50 && !visited.has(p.name)) {
+      visited.add(p.name);
+      speak(`你已到达 ${p.name}。${p.desc}`);
+      document.getElementById("info").innerText = `📍 已到达：${p.name}`;
+    }
+  }
+}
+
+
+    // ========== Haversine公式计算距离 ==========
+    function getDistance(lat1, lng1, lat2, lng2) {
+      const R = 6371000;
+      const toRad = deg => deg * Math.PI / 180;
+      const dLat = toRad(lat2 - lat1);
+      const dLng = toRad(lng2 - lng1);
+      const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng/2)**2;
+      return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
+
+    // ========== 语音播报 ==========
+    function speak(text) {
+      if ('speechSynthesis' in window) {
+        const utter = new SpeechSynthesisUtterance(text);
+        utter.lang = 'zh-CN';
+        utter.rate = 1.0;
+        speechSynthesis.speak(utter);
+      }
+    }
+  </script>
+</body>
+</html>
