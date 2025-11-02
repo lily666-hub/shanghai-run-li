@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>🏃 智能跑步导航（REST 步行 API，多途径点）</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body, #map { height: 100%; margin: 0; padding: 0; }
+    #info {
+      position: absolute;
+      top: 10px; left: 10px;
+      background: rgba(255,255,255,0.95);
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-family: "Microsoft Yahei", Arial;
+      box-shadow: 0 0 6px rgba(0,0,0,0.25);
+      z-index: 1000;
+      max-width: 340px;
+    }
+    #navPanel {
+      position: absolute;
+      right: 10px; top: 10px;
+      width: 360px;
+      height: 420px;
+      overflow-y: auto;
+      background: rgba(255,255,255,0.95);
+      border-radius: 8px;
+      padding: 10px;
+      box-shadow: 0 0 6px rgba(0,0,0,0.2);
+      font-family: "Microsoft Yahei", Arial;
+      z-index: 1000;
+    }
+    .small { font-size: 12px; color: #555; }
+    #controls { position:absolute; left:10px; bottom:10px; z-index:1000; background:rgba(255,255,255,0.95); padding:8px; border-radius:8px; box-shadow:0 0 6px rgba(0,0,0,0.2);}
+    button { margin-right:6px; padding:6px 8px; border-radius:6px; border:1px solid #ccc; background:#fff; cursor:pointer;}
+    input[type="file"] { display:inline-block; }
+  </style>
+
+  <!-- 环境变量配置 -->
+  <script src="/env-config.js"></script>
+  
+  <!-- 地图 JS 动态加载 -->
+  <script>
+    // 动态加载高德地图JS SDK
+    (function() {
+      const amapKey = window.VITE_AMAP_API_KEY || 'b4bbc4d6ac83b3431412e4f99c4d7b26';
+      const script = document.createElement('script');
+      script.src = `https://webapi.amap.com/maps?v=2.0&key=${amapKey}`;
+      document.head.appendChild(script);
+    })();
+  </script>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="info">🏃 初始化中…（单击地图可添加途径点，或上传 waypoints.csv）</div>
+  <div id="navPanel"><b>📜 导航提示</b><br><span class="small">等待路线规划...</span></div>
+
+  <div id="controls">
+    <button id="btnUseSample">加载示例 5 点</button>
+    <label style="margin-right:6px">
+      上传 CSV <input id="csvfile" type="file" accept=".csv" />
+    </label>
+    <button id="btnPlan">开始规划</button>
+    <button id="btnClear">清除途径点</button>
+    <span class="small" style="display:block;margin-top:6px">提示：上传 CSV 每行格式：name,lat,lng,desc</span>
+  </div>
+
+  <script>
+    // ---------- 配置：从环境变量获取 REST key ----------
+    const AMAP_REST_KEY = window.VITE_AMAP_REST_KEY || 'b4bbc4d6ac83b3431412e4f99c4d7b26'; // 从环境变量获取或使用默认值
+    // JS SDK key 在地图脚本 src 中也可替换
+
+    // ---------- 全局状态 ----------
+    let map = null; // 延迟初始化
+    let waypoints = []; // [{name, lat, lng, desc, marker}]
+    let markers = [];
+    let navSteps = [];   // [{instruction, path:[[lng,lat],...]}]
+    let fullPath = [];   // [[lng,lat], ...]
+    let polyline = null;
+    let stepIndex = 0;
+    let watchId = null;
+
+    const MIN_WP = 5; // 至少 5 个途径点
+
+    // ---------- 工具函数 ----------
+    function speak(text) {
+      if ("speechSynthesis" in window) {
+        const u = new SpeechSynthesisUtterance(text);
+        u.lang = "zh-CN"; u.rate = 1.0;
+        speechSynthesis.speak(u);
+      }
+    }
+
+    function parseCSVText(text) {
+      return text.trim().split(/\r?\n/).map(line => {
+        const parts = line.split(",").map(s => s.trim());
+        return { name: parts[0] || '点', lat: parseFloat(parts[1]), lng: parseFloat(parts[2]), desc: parts.slice(3).join(",") || '' };
+      }).filter(p => !isNaN(p.lat) && !isNaN(p.lng));
+    }
+
+    function addWaypoint(pt) {
+      // pt: {name, lat, lng, desc}
+      if (!map) {
+        console.warn('地图未初始化，无法添加途径点');
+        return;
+      }
+      const i = waypoints.length + 1;
+      const marker = new AMap.Marker({
+        position: [pt.lng, pt.lat],
+        map,
+        title: `${i}. ${pt.name}`,
+        content: `<div style="background:#007bff;color:#fff;padding:4px 8px;border-radius:6px;font-size:12px">${i}. ${pt.name}</div>`
+      });
+      waypoints.push({...pt, marker});
+      markers.push(marker);
+      updateInfo(`已添加途径点 ${waypoints.length}：${pt.name}`);
+    }
+
+    function clearWaypoints() {
+      waypoints.forEach(w => { if (w.marker) w.marker.setMap(null); });
+      waypoints = []; markers = [];
+      if (polyline) { polyline.setMap(null); polyline = null; }
+      navSteps = []; fullPath = []; stepIndex = 0;
+      updateInfo("已清除所有途径点");
+      renderNavPanel();
+    }
+
+    function updateInfo(text) { document.getElementById("info").innerText = text; }
+
+    function normalizePolylineString(polylineStr) {
+      // "lng,lat;lng,lat;..."
+      if (!polylineStr) return [];
+      return polylineStr.split(";").map(p => {
+        const [lng, lat] = p.split(",").map(Number);
+        return [lng, lat];
+      }).filter(Boolean);
+    }
+
+    function appendSegmentToFullPath(segmentPts) {
+      if (!segmentPts || segmentPts.length === 0) return;
+      // 去重连接：如果 fullPath 最后一点与 segmentPts 第一相同则去掉首
+      if (fullPath.length > 0) {
+        const last = fullPath[fullPath.length - 1];
+        const firstSeg = segmentPts[0];
+        if (Math.abs(last[0]-firstSeg[0]) < 1e-6 && Math.abs(last[1]-firstSeg[1]) < 1e-6) {
+          segmentPts = segmentPts.slice(1);
+        }
+      }
+      fullPath.push(...segmentPts);
+    }
+
+    function drawFullPolyline() {
+      if (!map) {
+        console.warn('地图未初始化，无法绘制路线');
+        return;
+      }
+      if (polyline) polyline.setMap(null);
+      if (!fullPath || fullPath.length === 0) {
+        updateInfo("⚠️ 没有路径可绘制");
+        return;
+      }
+      polyline = new AMap.Polyline({
+        path: fullPath,
+        map,
+        showDir: true,
+        strokeWeight: 5,
+        strokeColor: "#00A8FF",
+        lineJoin: "round"
+      });
+      map.setFitView([polyline]);
+      const km = (calcTotalDistance(fullPath) / 1000).toFixed(2);
+      updateInfo(`🏃 路线已绘制，长度 ${km} km（使用官方步行规划）`);
+    }
+
+    function calcTotalDistance(path) {
+      function getDistance(lat1, lng1, lat2, lng2) {
+        const R = 6371000, toRad = d => d * Math.PI / 180;
+        const dLat = toRad(lat2-lat1), dLng = toRad(lng2-lng1);
+        const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLng/2)**2;
+        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      }
+      let d = 0;
+      for (let i=1;i<path.length;i++){
+        const [lng1,lat1] = path[i-1];
+        const [lng2,lat2] = path[i];
+        d += getDistance(lat1,lng1,lat2,lng2);
+      }
+      return d;
+    }
+
+    // ---------- 地图点击加入途径点（已移至初始化函数中） ----------
+
+    // ---------- CSV 上传支持 ----------
+    document.getElementById('csvfile').addEventListener('change', async (ev) => {
+      const f = ev.target.files[0];
+      if (!f) return;
+      const txt = await f.text();
+      const pts = parseCSVText(txt);
+      if (!pts.length) { alert('CSV 解析失败或无有效点'); return; }
+      clearWaypoints();
+      pts.forEach(p => addWaypoint(p));
+      // 如果 < MIN_WP 则补足（接下来会自动插值保证 >= MIN_WP）
+      renderNavPanel();
+    });
+
+    // ---------- 加载示例 5 点 ----------
+    document.getElementById('btnUseSample').addEventListener('click', () => {
+      clearWaypoints();
+      // 示例固定5点（可按需修改）
+      const base = { lat: 31.2973, lng: 121.5035 };
+      const arr = [
+        { name: '起点', lat: base.lat, lng: base.lng, desc: '起点' },
+        { name: '点A', lat: base.lat + 0.0032, lng: base.lng + 0.0016, desc: '' },
+        { name: '点B', lat: base.lat + 0.0051, lng: base.lng + 0.004, desc: '' },
+        { name: '点C', lat: base.lat + 0.0038, lng: base.lng + 0.0065, desc: '' },
+        { name: '终点', lat: base.lat + 0.008, lng: base.lng + 0.0075, desc: '' }
+      ];
+      arr.forEach(p => addWaypoint(p));
+      renderNavPanel();
+    });
+
+    // ---------- 渲染导航面板（两部分：全部指令 + 当前/下一步） ----------
+    function renderNavPanel() {
+      const panel = document.getElementById('navPanel');
+      panel.innerHTML = '<b>📜 导航提示</b><br>';
+      panel.innerHTML += `<div class="small">途径点数：${waypoints.length}（至少 ${MIN_WP}）</div><hr>`;
+      // show waypoints list
+      panel.innerHTML += '<div style="font-weight:600">途径点（顺序）</div>';
+      waypoints.forEach((w,i) => {
+        panel.innerHTML += `<div style="margin-bottom:6px">${i+1}. ${w.name} (${w.lat.toFixed(5)}, ${w.lng.toFixed(5)})</div>`;
+      });
+      panel.innerHTML += '<hr>';
+      // show current and next
+      panel.innerHTML += '<div style="font-weight:600">当前/接下来指令</div>';
+      if (navSteps.length === 0) {
+        panel.innerHTML += '<div class="small">尚未规划路线</div>';
+      } else {
+        const cur = navSteps[stepIndex] || null;
+        if (cur) {
+          panel.innerHTML += `<div style="margin-bottom:8px"><b>当前：</b>${cur.instruction}</div>`;
+        } else panel.innerHTML += '<div>已完成全部指令</div>';
+        panel.innerHTML += '<div style="font-weight:600;margin-top:8px">完整指令列表</div>';
+        // full list
+        navSteps.forEach((s,i) => {
+          panel.innerHTML += `<div style="margin-bottom:6px">${i+1}. ${s.instruction}</div>`;
+        });
+        panel.innerHTML += `<div class="small">总指令数：${navSteps.length}</div>`;
+      }
+    }
+
+    // ---------- 处理少于 MIN_WP 自动插点（在每对点之间线性插值） ----------
+    function ensureMinWaypoints() {
+      if (waypoints.length >= MIN_WP) return;
+      const need = MIN_WP - waypoints.length;
+      // 把现有点两两间均匀插入新的点（简单策略）
+      const generated = [];
+      for (let i=0; generated.length < need; i = (i+1) % Math.max(1, waypoints.length-1)) {
+        const a = waypoints[i];
+        const b = waypoints[i+1] || waypoints[0];
+        const midLat = (a.lat + b.lat)/2 + (Math.random()-0.5)*1e-5;
+        const midLng = (a.lng + b.lng)/2 + (Math.random()-0.5)*1e-5;
+        generated.push({ name: `补点${generated.length+1}`, lat: midLat, lng: midLng, desc: '自动补足' });
+      }
+      generated.forEach(p => addWaypoint(p));
+      updateInfo(`路径点不足已自动补足到 ${waypoints.length} 个`);
+    }
+
+    // ---------- REST API: 获取某一段步行规划（origin & destination 为 lng,lat 字符串） ----------
+    async function fetchWalkingSegment(originLngLat, destLngLat) {
+      // originLngLat, destLngLat: "lng,lat" string
+      const url = `https://restapi.amap.com/v3/direction/walking?origin=${originLngLat}&destination=${destLngLat}&key=${AMAP_REST_KEY}&extensions=base`;
+
+      try {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (!data || data.status !== '1') {
+          console.warn('REST walking API 返回失败', data);
+          return null;
+        }
+        // data.route.paths[0] 包含 paths, steps
+        const pathObj = (data.route && data.route.paths && data.route.paths[0]) || null;
+        return pathObj;
+      } catch (e) {
+        console.error('fetchWalkingSegment error', e);
+        return null;
+      }
+    }
+
+    // ---------- 按途径点分段请求 REST API 并拼接路线 ----------
+    async function planByRestWalking() {
+      // 清空历史
+      navSteps = []; fullPath = []; stepIndex = 0;
+      if (polyline) { polyline.setMap(null); polyline = null; }
+
+      // 若不足 MIN_WP 自动补足
+      if (waypoints.length < MIN_WP) ensureMinWaypoints();
+
+      // 逐段规划
+      for (let i = 0; i < waypoints.length - 1; i++) {
+        const a = waypoints[i], b = waypoints[i+1];
+        updateInfo(`规划第 ${i+1} 段：${a.name} → ${b.name}（使用官方步行 API）`);
+        const origin = `${a.lng.toFixed(6)},${a.lat.toFixed(6)}`;
+        const destination = `${b.lng.toFixed(6)},${b.lat.toFixed(6)}`;
+        const seg = await fetchWalkingSegment(origin, destination);
+        if (seg) {
+          // seg.steps 每个 step 有 polyline 字符串
+          if (seg.steps && seg.steps.length) {
+            for (const s of seg.steps) {
+              const pts = normalizePolylineString(s.polyline);
+              appendSegmentToFullPath(pts);
+              navSteps.push({ instruction: s.instruction || s.action || '前进', path: pts });
+            }
+          } else if (seg.polyline) {
+            const pts = normalizePolylineString(seg.polyline);
+            appendSegmentToFullPath(pts);
+            navSteps.push({ instruction: `段 ${i+1}`, path: pts });
+          } else {
+            // 没有 polyline，退回为直线
+            const pts = [[a.lng, a.lat], [b.lng, b.lat]];
+            appendSegmentToFullPath(pts);
+            navSteps.push({ instruction: `直线（API无数据） ${a.name}→${b.name}`, path: pts });
+          }
+        } else {
+          // API 失败：退回直线连接
+          console.warn(`第 ${i+1} 段步行规划失败，使用直线连接`);
+          const pts = [[a.lng, a.lat], [b.lng, b.lat]];
+          appendSegmentToFullPath(pts);
+          navSteps.push({ instruction: `直线（API失败） ${a.name}→${b.name}`, path: pts });
+        }
+      }
+
+      // 绘制与展示
+      drawFullPolyline();
+      renderNavPanel();
+      speak('路线规划完成，已绘制在地图上。');
+    }
+
+    // ---------- normalize polyline string helper ----------
+    function normalizePolylineString(polylineStr) {
+      if (!polylineStr || typeof polylineStr !== 'string') return [];
+      return polylineStr.split(';').map(s => {
+        const [lng, lat] = s.split(',').map(Number);
+        return [lng, lat];
+      }).filter(p => !isNaN(p[0]) && !isNaN(p[1]));
+    }
+
+    // ---------- 实时定位与到达检测 ----------
+    function startRealtimeNav() {
+      if (!navigator.geolocation) {
+        alert('浏览器不支持定位，无法进行实时导航');
+        return;
+      }
+      if (watchId) navigator.geolocation.clearWatch(watchId);
+      watchId = navigator.geolocation.watchPosition(pos => {
+        const lat = pos.coords.latitude, lng = pos.coords.longitude;
+        handlePosition({lat, lng});
+      }, err => {
+        console.warn('watchPosition error', err);
+      }, { enableHighAccuracy: true, maximumAge: 2000, timeout: 10000 });
+    }
+
+    function handlePosition(pos) {
+      updateInfo(`📍 当前：${pos.lat.toFixed(5)}, ${pos.lng.toFixed(5)}`);
+      if (!navSteps || navSteps.length === 0) return;
+      const step = navSteps[stepIndex];
+      if (!step) return;
+      const stepPts = step.path && step.path.length ? step.path : null;
+      if (!stepPts || stepPts.length === 0) {
+        speak(step.instruction || `已完成第${stepIndex+1}步`);
+        stepIndex++;
+        renderNavPanel();
+        return;
+      }
+      const last = stepPts[stepPts.length-1];
+      const [lng, lat] = last;
+      // compute distance
+      function haversine(lat1,lng1,lat2,lng2){
+        const R = 6371000, toRad = d => d*Math.PI/180;
+        const dLat = toRad(lat2-lat1), dLng = toRad(lng2-lng1);
+        const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLng/2)**2;
+        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      }
+      const dist = haversine(pos.lat, pos.lng, lat, lng);
+      document.getElementById('info').innerText = `🚶 距离当前指令终点 ${Math.round(dist)} 米`;
+      const arriveThreshold = 25; // 可调整
+      if (dist <= arriveThreshold) {
+        speak(step.instruction || `已到达第${stepIndex+1}步`);
+        stepIndex++;
+        renderNavPanel();
+      } else if (dist > 80) {
+        // 可自动重规划，这里仅显示提示（你可以按需开启自动重规划）
+        // speak('注意：你偏离路线较远，建议重规划。');
+      }
+    }
+
+    // ---------- 绑定按钮 ----------
+    document.getElementById('btnPlan').addEventListener('click', async () => {
+      if (!AMAP_REST_KEY || AMAP_REST_KEY === 'YOUR_REST_KEY_HERE') {
+        alert('请在代码顶部将 AMAP_REST_KEY 替换为你的 Web 服务 API Key（REST）');
+        return;
+      }
+      if (waypoints.length < 2) {
+        alert('请先添加至少 2 个途径点（建议 >=5），可点击地图添加或上传 CSV 或加载示例');
+        return;
+      }
+      document.getElementById('btnPlan').disabled = true;
+      await planByRestWalking();
+      startRealtimeNav();
+      document.getElementById('btnPlan').disabled = false;
+    });
+
+    document.getElementById('btnClear').addEventListener('click', () => {
+      clearWaypoints();
+    });
+
+    // ---------- 地图初始化函数 ----------
+    function initializeMap() {
+      if (typeof AMap !== 'undefined') {
+        map = new AMap.Map("map", { zoom: 15, center: [121.5035, 31.2973] });
+        
+        // 添加地图点击事件
+        map.on('click', (e) => {
+          const { lng, lat } = e.lnglat;
+          const name = `点${waypoints.length + 1}`;
+          addWaypoint({ name, lat, lng, desc: '手动添加' });
+        });
+        
+        updateInfo('地图初始化完成，单击地图可添加途径点');
+        
+        // 页面加载时：可默认加载一个示例（可注释）
+        //document.getElementById('btnUseSample').click();
+        
+        // 初始渲染
+        renderNavPanel();
+      } else {
+        // 如果AMap还未加载，等待100ms后重试
+        setTimeout(initializeMap, 100);
+      }
+    }
+
+    // ---------- 等待SDK加载完成后初始化地图 ----------
+    if (typeof AMap !== 'undefined') {
+      initializeMap();
+    } else {
+      // 监听SDK加载完成
+      window.addEventListener('load', initializeMap);
+    }
+
+  </script>
+</body>
+</html>
